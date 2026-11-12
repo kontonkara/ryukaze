@@ -143,7 +143,8 @@ pub enum Message {
     /// "Copied" said long enough.
     CopiedGone,
     /// The saved keyboard profiles, in TOML, for the settings copied.
-    ProfilesRead(Vec<String>),
+    /// The daemon's config, TOML, for the copy.
+    ConfigRead(Result<String, String>),
     AdaptiveFans(bool),
     GpuFollowsCpu(bool),
     AutoCoolerBoost(bool),
@@ -693,44 +694,31 @@ impl App {
             Message::GpuFollowsCpu(on) => {
                 self.call(move |client| async move { client.set_gpu_fan_follows_cpu(on).await })
             }
-            // With the saved keyboard profiles, read from the daemon first.
-            Message::CopyAsNix => {
-                let Some(Ok(status)) = &self.status else {
-                    return Task::none();
-                };
-                let saved = status.keyboard_saved_profiles.clone().unwrap_or_default();
-                match self.client.clone() {
-                    Some(client) if !saved.is_empty() => Task::perform(
-                        async move {
-                            let mut read = Vec::new();
-                            for name in saved {
-                                if let Ok(profile) = client.read_keyboard_profile(&name).await {
-                                    read.push(profile);
-                                }
-                            }
-                            read
-                        },
-                        Message::ProfilesRead,
-                    ),
-                    _ => self.update(Message::ProfilesRead(Vec::new())),
+            // The daemon's config, whole: read from it first.
+            Message::CopyAsNix => match self.client.clone() {
+                Some(client) => Task::perform(
+                    async move { client.read_config().await.map_err(client::describe) },
+                    Message::ConfigRead,
+                ),
+                None if self.demo => {
+                    self.update(Message::ConfigRead(Ok(crate::demo::CONFIG.into())))
                 }
-            }
+                None => Task::none(),
+            },
             Message::CopiedGone => {
                 self.copied = false;
                 Task::none()
             }
-            Message::ProfilesRead(profiles) => {
-                let Some(Ok(status)) = &self.status else {
-                    return Task::none();
+            Message::ConfigRead(config) => {
+                let nix = match config.and_then(|config| crate::nix::settings(&config)) {
+                    Ok(nix) => nix,
+                    Err(err) => {
+                        self.error = Some(err);
+                        return Task::none();
+                    }
                 };
-                let profiles = profiles
-                    .iter()
-                    .filter_map(|profile| lights::Editor::from_toml(profile).ok())
-                    .map(|editor| editor.nix_value())
-                    .collect();
                 self.copied = true;
-                let copy =
-                    iced::clipboard::write(crate::nix::settings(status, &curves(status), profiles));
+                let copy = iced::clipboard::write(nix);
                 // The note says so for a moment, then what it said before.
                 let gone = Task::perform(async { tokio::time::sleep(COPIED_FOR).await }, |()| {
                     Message::CopiedGone
@@ -1990,6 +1978,25 @@ mod tests {
         assert!(ui.find("no such mode").is_ok());
     }
 
+    /// Where cpufreq names preferences, a scenario picks one of them.
+    #[test]
+    fn the_scenarios_editor_picks_the_cpu_preference() {
+        let read = "[[scenarios]]\nname = \"games\"\nshift_mode = \"turbo\"\n";
+        let editing = |status| {
+            let mut app = app(status);
+            app.scenarios = Some(scenarios::Editor::from_toml(read).unwrap());
+            app.editing_scenarios = true;
+            app
+        };
+        let bare = editing(alpha17());
+        assert!(tall(&bare).find("CPU preference").is_err());
+
+        let mut status = alpha17();
+        status.epp_names = Some(["default", "balance_power"].map(Into::into).into());
+        let app = editing(status);
+        assert!(tall(&app).find("CPU preference").is_ok());
+    }
+
     /// On `page`, as its row in the sidebar opens it.
     fn on(page: Page, status: Status) -> App {
         App {
@@ -2578,7 +2585,10 @@ mod tests {
         }
 
         let shown = |app: &App, text: &str| narrow(app).find(text).is_ok();
+        // Without the daemon there's nothing to copy.
         let _ = app.update(Message::CopyAsNix);
+        assert!(!shown(&app, "Copied, for services.ryukaze.settings"));
+        let _ = app.update(Message::ConfigRead(Ok("charge_limit = 70\n".into())));
         assert!(shown(&app, "Copied, for services.ryukaze.settings"));
         // A change after the copy isn't in it.
         let _ = app.update(Message::Applied(Ok(())));

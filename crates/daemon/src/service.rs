@@ -11,6 +11,7 @@ use ryukaze_core::{
     COOLER_BOOST_MARKS, Status,
     apex::{self, APEX, Apex},
     dgpu::{self, Dgpu},
+    epp::{self, Epp},
     fans::{self, Curve, Fan, Layout},
     gpu_mux::{self, GpuMode, GpuMux},
     keyboard::{self, Klc},
@@ -89,6 +90,8 @@ pub struct Service {
     /// those the config sets, `config_set`, which it decides; and where.
     changes: config::Changes,
     config_set: config::Changes,
+    /// The config's file, every key of it as read.
+    config_file: toml::Table,
     changes_file: Option<state::File>,
     /// What to apply when the laptop goes on AC or on battery.
     source_profiles: config::Profiles,
@@ -108,6 +111,9 @@ pub struct Service {
     ppd_found: bool,
     ppd_sync: bool,
     ppd_resync: bool,
+    /// The CPU's preference the profile applied last asked for, written
+    /// again after power-profiles-daemon writes its own.
+    epp: Option<String>,
     /// Where the controller's hidraw node is.
     dev: PathBuf,
 }
@@ -253,6 +259,7 @@ fn built_in_scenarios(ec: &MsiEc) -> Vec<Scenario> {
             shift_mode: Some(shift.into()),
             fan_mode: Some(fan.into()),
             super_battery,
+            epp: None,
         })
         .collect()
 }
@@ -303,6 +310,7 @@ impl Service {
             bar_sent: std::sync::Mutex::default(),
             changes: config::Changes::default(),
             config_set: config::Changes::default(),
+            config_file: toml::Table::new(),
             changes_file: None,
             source_profiles: config::Profiles::default(),
             power_light: config::PowerLight::default(),
@@ -315,15 +323,21 @@ impl Service {
             ppd_found: false,
             ppd_sync: true,
             ppd_resync: false,
+            epp: None,
             dev: PathBuf::from("/dev"),
         }
     }
 
     /// The modes `profile` sets: super battery left before the shift mode
-    /// goes up, and entered after it comes down. All are tried; the first
-    /// failure is returned and the others logged.
+    /// goes up, and entered after it comes down, then the CPU's preference
+    /// where it sets one. All are tried; the first failure is returned and
+    /// the others logged.
     pub fn apply_profile(&mut self, profile: &Profile) -> fdo::Result<()> {
         let profile = &self.fit(self.resolve(profile)?);
+        let epp = |service: &mut Self| {
+            service.epp = profile.epp.as_ref().map(ToString::to_string);
+            Some(service.put_epp())
+        };
         let super_battery = |service: &mut Self| {
             profile
                 .super_battery
@@ -338,9 +352,19 @@ impl Service {
             Some(service.set_shift_mode(mode))
         };
         let results = if profile.super_battery == Some(true) {
-            [shift_mode(self), fan_mode(self), super_battery(self)]
+            [
+                shift_mode(self),
+                fan_mode(self),
+                super_battery(self),
+                epp(self),
+            ]
         } else {
-            [super_battery(self), fan_mode(self), shift_mode(self)]
+            [
+                super_battery(self),
+                fan_mode(self),
+                shift_mode(self),
+                epp(self),
+            ]
         };
         let mut errors = results.into_iter().flatten().filter_map(Result::err);
         let first = errors.next();
@@ -411,7 +435,35 @@ impl Service {
             shift_mode: profile.shift_mode.clone().or(modes.shift_mode),
             fan_mode: profile.fan_mode.clone().or(modes.fan_mode),
             super_battery: profile.super_battery.or(modes.super_battery),
+            epp: profile.epp.clone().or(modes.epp),
         })
+    }
+
+    /// The CPU's preference the profile applied last asked for, if any:
+    /// at its application, and again wherever power-profiles-daemon has
+    /// written its own since, as it does with a profile, a power source
+    /// and its own start.
+    pub fn put_epp(&self) -> fdo::Result<()> {
+        let Some(want) = &self.epp else {
+            return Ok(());
+        };
+        let sysfs = self.ec.sysfs();
+        let before = epp::first(sysfs).map_err(|e| epp_error(want, e))?;
+        if before == *want {
+            return Ok(());
+        }
+        epp::set(sysfs, want).map_err(|e| epp_error(want, e))?;
+        info!("epp: {before} -> {want}");
+        Ok(())
+    }
+
+    /// Every couple of seconds: the preference back where it was written
+    /// over. One that can't be put back is let go, not tried forever.
+    fn keep_epp(&mut self) {
+        if let Err(err) = self.put_epp() {
+            warn!("{err}; leaving it");
+            self.epp = None;
+        }
     }
 
     /// Follows power-profiles-daemon to `profile`, unless the shift mode
@@ -449,6 +501,11 @@ impl Service {
         };
         self.set_shift_mode(mode)?;
         Ok(Some(format!("shift mode {mode}")))
+    }
+
+    /// From the config: its file as read, for `ReadConfig`.
+    pub fn put_config_file(&mut self, file: toml::Table) {
+        self.config_file = file;
     }
 
     /// From the config: whether turbo is Apex on AC.
@@ -662,6 +719,8 @@ impl Service {
         let shift_modes = self.shift_modes_here().ok();
         let fan_modes = self.ec.fan_modes().ok();
         let super_battery = self.ec.super_battery().is_ok();
+        let epp_names = epp::names(self.ec.sysfs());
+        let epp_numbers = epp::numbers(self.ec.sysfs()).unwrap_or(false);
         for (i, scenario) in scenarios.iter().enumerate() {
             let name = &scenario.name;
             if name.trim().is_empty() {
@@ -681,6 +740,20 @@ impl Service {
             }
             if scenario.super_battery.is_some() && !super_battery {
                 return Err(format!("{name}: this EC has no super battery"));
+            }
+            match (&scenario.epp, &epp_names) {
+                (None, _) => {}
+                (Some(Epp::Raw(_)), Ok(_)) if epp_numbers => {}
+                (Some(Epp::Raw(_)), Ok(_)) => {
+                    return Err(format!("{name}: an epp number only with intel_pstate"));
+                }
+                (Some(Epp::Named(epp)), Ok(names)) if names.contains(epp) => {}
+                (Some(Epp::Named(epp)), Ok(names)) => {
+                    return Err(format!("{name}: {epp} is not one of: {}", names.join(", ")));
+                }
+                (Some(_), Err(_)) => {
+                    return Err(format!("{name}: this CPU's cpufreq driver has no epp"));
+                }
             }
         }
         let set = &self.config_set;
@@ -1278,6 +1351,7 @@ impl Service {
         self.auto_boost();
         self.watch_dgpu();
         self.name_bios_turbo();
+        self.keep_epp();
         adapted
     }
 
@@ -1576,6 +1650,8 @@ impl Service {
             fan_mode: now.fan_mode,
             fan_modes: field("available_fan_modes", ec.fan_modes()),
             super_battery: now.super_battery,
+            epp_names: field("epp", epp::names(ec.sysfs())),
+            epp_numbers: field("epp", epp::numbers(ec.sysfs())),
             cooler_boost: now.cooler_boost,
             scenario,
             scenarios,
@@ -1991,6 +2067,41 @@ impl Service {
         )
     }
 
+    /// The config as it stands, in TOML: its file, every key of it, under
+    /// what was changed over D-Bus and is kept, with the keyboard profiles
+    /// saved here and the one picked last. What neither sets isn't in it.
+    pub fn read_config(&self) -> fdo::Result<String> {
+        let failed = |err: toml::ser::Error| fdo::Error::Failed(format!("config: {err}"));
+        let mut config = self.config_file.clone();
+        config::lay(&mut config, self.changes.as_config());
+        let mut keyboard = toml::Table::new();
+        let mut profiles = match config.get("keyboard").and_then(|k| k.get("profiles")) {
+            Some(toml::Value::Array(profiles)) => profiles.clone(),
+            _ => Vec::new(),
+        };
+        let configured = profiles.len();
+        for name in self.keyboard_saved_names() {
+            let saved = self.keyboard_kept.profiles.iter().find(|p| p.name == name);
+            if let Some(saved) = saved {
+                profiles.push(toml::Value::try_from(saved).map_err(failed)?);
+            }
+        }
+        if profiles.len() > configured {
+            keyboard.insert("profiles".into(), profiles.into());
+        }
+        if let Some(picked) = &self.keyboard_kept.picked {
+            keyboard.insert("profile".into(), picked.clone().into());
+        }
+        if !keyboard.is_empty() {
+            let mut kept = toml::Table::new();
+            kept.insert("keyboard".into(), keyboard.into());
+            // Under the config's own: what it names, it decides.
+            config::lay(&mut kept, std::mem::take(&mut config));
+            config = kept;
+        }
+        toml::to_string(&config).map_err(failed)
+    }
+
     /// The scenarios, `[[scenarios]]` in TOML as the config writes them:
     /// for an editor to start from.
     pub fn read_scenarios(&self) -> fdo::Result<String> {
@@ -2257,6 +2368,15 @@ fn apply<T: PartialEq + Display>(
     }
     info!("{name}: {before} -> {want}");
     Ok(())
+}
+
+fn epp_error(epp: &str, err: io::Error) -> fdo::Error {
+    match err.kind() {
+        io::ErrorKind::NotFound => {
+            fdo::Error::NotSupported("epp: this CPU's cpufreq driver has none".into())
+        }
+        _ => fdo::Error::IOError(format!("epp: {epp}: {err}")),
+    }
 }
 
 fn error(name: &str, err: io::Error) -> fdo::Error {
@@ -2704,6 +2824,7 @@ mod tests {
             shift_mode: Some("turbo".into()),
             fan_mode: None,
             super_battery: None,
+            epp: None,
         };
         let ec = MsiEc::new(sysfs.path());
         let mut service = Service::new(ec, None, AutoBoost::default(), vec![games]);
@@ -2712,6 +2833,164 @@ mod tests {
         assert_eq!(service.status().scenario.as_deref(), Some("games"));
         // A lone one stays put.
         assert_eq!(service.next_scenario().unwrap(), "games");
+    }
+
+    /// intel_pstate's cpufreq with two policies at `epp`.
+    fn cpufreq(sysfs: &Path, epp: &str) {
+        for policy in ["policy0", "policy1"] {
+            let policy = sysfs.join("devices/system/cpu/cpufreq").join(policy);
+            fs::create_dir_all(&policy).unwrap();
+            fs::write(policy.join("scaling_driver"), "intel_pstate\n").unwrap();
+            fs::write(
+                policy.join("energy_performance_preference"),
+                format!("{epp}\n"),
+            )
+            .unwrap();
+            fs::write(
+                policy.join("energy_performance_available_preferences"),
+                "default performance balance_performance balance_power power \n",
+            )
+            .unwrap();
+        }
+    }
+
+    fn epp_now(sysfs: &Path) -> Option<String> {
+        epp::get(sysfs).unwrap()
+    }
+
+    const WITH_EPP: &str = "[[scenarios]]\nname = \"quiet\"\nshift_mode = \"eco\"\n\n[[scenarios]]\nname = \"games\"\nshift_mode = \"turbo\"\nepp = 132\n";
+
+    #[test]
+    fn a_scenario_sets_the_cpu_preference_and_puts_it_back() {
+        let sysfs = alpha17("17KKIMS1.115");
+        cpufreq(sysfs.path(), "balance_performance");
+        let mut service = service(sysfs.path());
+        service.set_scenarios(WITH_EPP).unwrap();
+
+        // One without it leaves the preference alone.
+        service.set_scenario("quiet").unwrap();
+        assert_eq!(
+            epp_now(sysfs.path()).as_deref(),
+            Some("balance_performance")
+        );
+        service.put_epp().unwrap();
+        assert_eq!(
+            epp_now(sysfs.path()).as_deref(),
+            Some("balance_performance")
+        );
+
+        service.set_scenario("games").unwrap();
+        assert_eq!(epp_now(sysfs.path()).as_deref(), Some("132"));
+
+        // power-profiles-daemon writes its own with the profile.
+        cpufreq(sysfs.path(), "performance");
+        service.put_epp().unwrap();
+        assert_eq!(epp_now(sysfs.path()).as_deref(), Some("132"));
+
+        // And with no word of it, at a power source or its start: the
+        // tick sees.
+        cpufreq(sysfs.path(), "balance_performance");
+        service.tick().unwrap();
+        assert_eq!(epp_now(sysfs.path()).as_deref(), Some("132"));
+
+        // One that can't be written is let go.
+        let policies = sysfs.path().join("devices/system/cpu/cpufreq");
+        fs::remove_dir_all(&policies).unwrap();
+        service.tick().unwrap();
+        cpufreq(sysfs.path(), "performance");
+        service.tick().unwrap();
+        assert_eq!(epp_now(sysfs.path()).as_deref(), Some("performance"));
+        service.set_scenario("games").unwrap();
+        assert_eq!(epp_now(sysfs.path()).as_deref(), Some("132"));
+
+        // Back in one without it, what's written elsewhere stays.
+        service.set_scenario("quiet").unwrap();
+        cpufreq(sysfs.path(), "power");
+        service.put_epp().unwrap();
+        assert_eq!(epp_now(sysfs.path()).as_deref(), Some("power"));
+    }
+
+    #[test]
+    fn a_profile_takes_its_scenarios_cpu_preference_or_its_own() {
+        let sysfs = alpha17("17KKIMS1.115");
+        cpufreq(sysfs.path(), "performance");
+        let mut service = service(sysfs.path());
+        service.set_scenarios(WITH_EPP).unwrap();
+        let profile = |epp| Profile {
+            scenario: Some("games".into()),
+            epp,
+            ..Profile::default()
+        };
+        service.apply_profile(&profile(None)).unwrap();
+        assert_eq!(epp_now(sysfs.path()).as_deref(), Some("132"));
+        let own = Some(Epp::Named("balance_power".into()));
+        service.apply_profile(&profile(own)).unwrap();
+        assert_eq!(epp_now(sysfs.path()).as_deref(), Some("balance_power"));
+    }
+
+    /// The file whole, a key the daemon doesn't know of too, under what
+    /// the window changed, the power button's light where the config has
+    /// it.
+    #[test]
+    fn reads_the_config_whole() {
+        let sysfs = alpha17("17KKIMS1.115");
+        let mut service = service(sysfs.path());
+        assert_eq!(service.read_config().unwrap(), "");
+
+        let file = "apex_on_ac = true\nlater = \"a key of some later day\"\n\n[profiles.ac]\nscenario = \"games\"\n\n[[scenarios]]\nname = \"games\"\nshift_mode = \"turbo\"\nepp = 132\n\n[keyboard.power]\ndgpu_waking = true\n";
+        service.put_config_file(toml::from_str(file).unwrap());
+        let read: toml::Table = toml::from_str(&service.read_config().unwrap()).unwrap();
+        assert_eq!(read, toml::from_str::<toml::Table>(file).unwrap());
+
+        let color = |hex: &str| config::KeyboardColor(hex.parse().unwrap());
+        service.changes = config::Changes {
+            charge_limit: Some(70),
+            fans: config::FanChanges {
+                gpu_follows_cpu: Some(true),
+                ..config::FanChanges::default()
+            },
+            keyboard: config::KeyboardChanges {
+                power: Some(config::PowerFollows::ShiftMode),
+                power_colors: [
+                    ("dgpu".to_owned(), color("#ff0000")),
+                    ("eco".to_owned(), color("#00ff00")),
+                ]
+                .into(),
+                scenarios: [
+                    ("games".to_owned(), "wave".to_owned()),
+                    ("quiet".to_owned(), String::new()),
+                ]
+                .into(),
+                ..config::KeyboardChanges::default()
+            },
+            ..config::Changes::default()
+        };
+        service.keyboard_kept.picked = Some("wave".into());
+        let read: toml::Table = toml::from_str(&service.read_config().unwrap()).unwrap();
+        let want = "apex_on_ac = true\ncharge_limit = 70\nlater = \"a key of some later day\"\n\n[fans]\ngpu_follows_cpu = true\n\n[profiles.ac]\nscenario = \"games\"\n\n[[scenarios]]\nname = \"games\"\nshift_mode = \"turbo\"\nepp = 132\n\n[keyboard]\nprofile = \"wave\"\n\n[keyboard.scenarios]\ngames = \"wave\"\n\n[keyboard.power]\nfollows = \"shift_mode\"\ndgpu_waking = true\ndgpu_awake = \"#ff0000\"\n\n[keyboard.power.shift_modes]\neco = \"#00ff00\"\n";
+        assert_eq!(read, toml::from_str::<toml::Table>(want).unwrap());
+    }
+
+    #[test]
+    fn scenarios_name_cpu_preferences_there_are() {
+        let sysfs = alpha17("17KKIMS1.115");
+        let mut bare = service(sysfs.path());
+        let err = bare.set_scenarios(WITH_EPP).unwrap_err();
+        assert!(err.to_string().contains("has no epp"), "{err}");
+
+        cpufreq(sysfs.path(), "performance");
+        let mut service = service(sysfs.path());
+        let named = WITH_EPP.replace("132", "\"fast\"");
+        let err = service.set_scenarios(&named).unwrap_err();
+        assert!(err.to_string().contains("fast is not one of"), "{err}");
+        service.set_scenarios(WITH_EPP).unwrap();
+        assert_eq!(service.status().epp_numbers, Some(true));
+
+        let driver = "devices/system/cpu/cpufreq/policy0/scaling_driver";
+        fs::write(sysfs.path().join(driver), "amd-pstate-epp\n").unwrap();
+        let err = service.set_scenarios(WITH_EPP).unwrap_err();
+        assert!(err.to_string().contains("only with intel_pstate"), "{err}");
+        assert_eq!(service.status().epp_numbers, Some(false));
     }
 
     #[test]
@@ -2801,6 +3080,7 @@ mod tests {
             shift_mode: Some("turbo".into()),
             fan_mode: None,
             super_battery: None,
+            epp: None,
         };
         let ec = MsiEc::new(sysfs.path());
         let mut service = Service::new(ec, None, AutoBoost::default(), vec![games]);
@@ -3356,6 +3636,7 @@ mod tests {
             shift_mode: Some("turbo".into()),
             fan_mode: None,
             super_battery: None,
+            epp: None,
         };
         assert_eq!(
             titan.fit(performance.modes()).shift_mode.as_deref(),
@@ -3385,6 +3666,42 @@ mod tests {
         plug(sysfs.path(), false);
         titan.follow_source().unwrap();
         assert_eq!(titan.status().shift_mode.as_deref(), Some("turbo"));
+    }
+
+    /// A scenario written as Apex is turbo off AC: applied, known for the
+    /// one the EC is in and stepped from.
+    #[test]
+    fn a_scenario_in_apex_is_turbo_off_ac() {
+        let scenarios = "[[scenarios]]\nname = \"silent\"\nshift_mode = \"eco\"\n\n[[scenarios]]\nname = \"performance\"\nshift_mode = \"apex\"\n";
+        let sysfs = titan18hx("eco", 0xc2, false);
+        let mut titan = service(sysfs.path());
+        titan.put_apex_on_ac(true);
+        titan.set_scenarios(scenarios).unwrap();
+
+        titan.set_scenario("performance").unwrap();
+        assert_eq!(titan.status().shift_mode.as_deref(), Some("turbo"));
+        assert_eq!(titan.status().scenario.as_deref(), Some("performance"));
+        assert_eq!(titan.next_scenario().unwrap(), "silent");
+        assert_eq!(
+            titan
+                .follow_power_profile("performance")
+                .unwrap()
+                .as_deref(),
+            Some("scenario performance")
+        );
+        assert_eq!(titan.status().shift_mode.as_deref(), Some("turbo"));
+
+        // In Apex on AC, it's the same scenario, there and unplugged.
+        let sysfs = titan18hx("unknown (197)", 0xc5, true);
+        let mut titan = service(sysfs.path());
+        titan.put_apex_on_ac(true);
+        titan.set_scenarios(scenarios).unwrap();
+        assert_eq!(titan.status().scenario.as_deref(), Some("performance"));
+        assert_eq!(titan.follow_power_profile("performance").unwrap(), None);
+        plug(sysfs.path(), false);
+        titan.follow_source().unwrap();
+        assert_eq!(titan.status().shift_mode.as_deref(), Some("turbo"));
+        assert_eq!(titan.status().scenario.as_deref(), Some("performance"));
     }
 
     #[test]

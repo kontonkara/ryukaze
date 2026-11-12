@@ -8,6 +8,9 @@ use ryukaze_core::Status;
 
 use crate::app::Message;
 
+/// Its config, as the daemon would give it for the copy.
+pub const CONFIG: &str = "apex_on_ac = true\ncharge_limit = 80\n\n[profiles.ac]\nscenario = \"performance\"\n\n[[scenarios]]\nname = \"silent\"\nshift_mode = \"eco\"\n\n[[scenarios]]\nname = \"balanced\"\nshift_mode = \"comfort\"\n\n[[scenarios]]\nname = \"performance\"\nshift_mode = \"turbo\"\nepp = 132\n";
+
 /// A Titan 18 HX, more or less.
 pub fn status() -> Status {
     let names = |names: &[&str]| Some(names.iter().map(|&name| name.to_owned()).collect());
@@ -18,6 +21,14 @@ pub fn status() -> Status {
         fan_mode: Some("advanced".into()),
         fan_modes: names(&["auto", "silent", "advanced"]),
         super_battery: Some(false),
+        epp_names: names(&[
+            "default",
+            "performance",
+            "balance_performance",
+            "balance_power",
+            "power",
+        ]),
+        epp_numbers: Some(true),
         cooler_boost: Some(false),
         scenario: Some("performance".into()),
         scenarios: names(&["silent", "balanced", "performance"]),

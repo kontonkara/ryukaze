@@ -6,6 +6,7 @@ use std::{collections::BTreeMap, fs, io, path::Path};
 use anyhow::{Context, Result, bail};
 use ryukaze_core::{
     COOLER_BOOST_MARKS,
+    epp::Epp,
     fans::{Curve, Fan},
     keyboard,
     lighting::{self, Color, Effect, Lighting, Origin, Part, Zone},
@@ -60,6 +61,23 @@ pub struct Config {
     /// it decides at every start.
     #[serde(skip)]
     pub set: Changes,
+
+    /// The file as it was read, every key of it: what `ReadConfig` gives
+    /// back.
+    #[serde(skip)]
+    pub file: toml::Table,
+}
+
+/// `over` laid on `under`: a table key by key, anything else whole.
+pub fn lay(under: &mut toml::Table, over: toml::Table) {
+    for (key, value) in over {
+        match (under.get_mut(&key), value) {
+            (Some(toml::Value::Table(under)), toml::Value::Table(over)) => lay(under, over),
+            (_, value) => {
+                under.insert(key, value);
+            }
+        }
+    }
 }
 
 /// The keyboard's backlight, set at start, after sleep and whenever the
@@ -922,6 +940,47 @@ impl Changes {
         .collect()
     }
 
+    /// These as the config writes them, to lay over its file: the same
+    /// keys, but the power button's light, flat here and under
+    /// `keyboard.power` there.
+    pub fn as_config(&self) -> toml::Table {
+        let mut table = toml::Table::try_from(self).unwrap_or_default();
+        let Some(toml::Value::Table(keyboard)) = table.get_mut("keyboard") else {
+            return table;
+        };
+        let mut power = toml::Table::new();
+        if let Some(follows) = keyboard.remove("power") {
+            power.insert("follows".into(), follows);
+        }
+        if let Some(waking) = keyboard.remove("power_dgpu_waking") {
+            power.insert("dgpu_waking".into(), waking);
+        }
+        if let Some(toml::Value::Table(colors)) = keyboard.remove("power_colors") {
+            let mut modes = toml::Table::new();
+            for (name, color) in colors {
+                if name == "dgpu" {
+                    power.insert("dgpu_awake".into(), color);
+                } else {
+                    modes.insert(name, color);
+                }
+            }
+            if !modes.is_empty() {
+                power.insert("shift_modes".into(), modes.into());
+            }
+        }
+        if !power.is_empty() {
+            keyboard.insert("power".into(), power.into());
+        }
+        // `""` is a scenario with no profile of its own: no key at all.
+        if let Some(toml::Value::Table(scenarios)) = keyboard.get_mut("scenarios") {
+            scenarios.retain(|_, profile| profile.as_str() != Some(""));
+            if scenarios.is_empty() {
+                keyboard.remove("scenarios");
+            }
+        }
+        table
+    }
+
     /// These but for the keys `set` has: the config's to decide.
     pub fn without(self, set: &Changes) -> Self {
         fn unless<T, U>(value: Option<T>, set: &Option<U>) -> Option<T> {
@@ -1036,6 +1095,10 @@ pub struct Profile {
     pub fan_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub super_battery: Option<bool>,
+    /// The CPU's energy-performance preference, held against whatever
+    /// else writes one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub epp: Option<Epp>,
 }
 
 /// A [`Profile`] with a name, written out in full in the config: serde
@@ -1050,6 +1113,10 @@ pub struct Scenario {
     pub fan_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub super_battery: Option<bool>,
+    /// The CPU's energy-performance preference, held against whatever
+    /// else writes one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub epp: Option<Epp>,
 }
 
 /// MSI Center's scenarios, for an EC without configured ones: (name, shift
@@ -1068,6 +1135,7 @@ impl Scenario {
             shift_mode: self.shift_mode.clone(),
             fan_mode: self.fan_mode.clone(),
             super_battery: self.super_battery,
+            epp: self.epp.clone(),
         }
     }
 }
@@ -1086,6 +1154,7 @@ impl Config {
         let table: toml::Table =
             toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
         config.set = Changes::set_in(&config, &table);
+        config.file = table;
         if let Some(percent) = config.charge_limit
             && !(10..=100).contains(&percent)
         {
@@ -1302,6 +1371,18 @@ mod tests {
             load("[[scenarios]]\nname = \"a\"\nshift_mode = \"eco\"\n[[scenarios]]\nname = \"a\"\nshift_mode = \"turbo\"\n")
                 .is_err()
         );
+    }
+
+    #[test]
+    fn reads_the_cpu_preference_as_a_name_or_a_number() {
+        let config = load(
+            "[[scenarios]]\nname = \"games\"\nshift_mode = \"turbo\"\nepp = 132\n[profiles.battery]\nepp = \"power\"\n",
+        )
+        .unwrap();
+        assert_eq!(config.scenarios[0].epp, Some(Epp::Raw(132)));
+        let battery = config.profiles.get(Source::Battery).unwrap();
+        assert_eq!(battery.epp, Some(Epp::Named("power".into())));
+        assert!(load("[profiles.ac]\nepp = 256\n").is_err());
     }
 
     #[test]
